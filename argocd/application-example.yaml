@@ -1,0 +1,56 @@
+# App-side settings that go with argocd-hosted-cluster.yaml.
+# The ArgoCD CR can't set these; they belong on each Application or ApplicationSet template.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: team-a-payments
+  namespace: openshift-gitops
+  annotations:
+    # Monorepo: a webhook push refreshes ONLY the apps whose paths changed,
+    # and the repo-server reuses cached manifests for the others.
+    # This is the biggest single win for large repos. Paths are relative to spec.source.path;
+    # list shared values/library chart directories too.
+    argocd.argoproj.io/manifest-generate-paths: .;../../shared-values
+spec:
+  project: team-a
+  source:
+    repoURL: https://git.example.com/platform/apps-monorepo.git
+    targetRevision: main
+    path: charts/payments
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: payments
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # A sync that hits a Degraded resource fails and is retried with
+    # backoff, instead of hanging in a wave forever.
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - RespectIgnoreDifferences=true   # don't overwrite operator- or HPA-owned fields on sync
+      - ApplyOutOfSyncOnly=true         # large apps: only apply what changed
+      - PruneLast=true
+---
+# Chart-side conventions so built-in health checks fail fast (put these in charts, not here):
+#
+#   Deployment / StatefulSet:
+#     spec.progressDeadlineSeconds: 300      # default 600; Argo reports Degraded once exceeded
+#
+#   Hook Jobs (PreSync/Sync/PostSync, or Jobs in waves):
+#     spec.activeDeadlineSeconds: 600        # a hung Job becomes Failed, which fails the hook
+#     spec.backoffLimit: 2
+#     metadata.annotations:
+#       argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+#
+#   Helm charts in Git that use remote (non file://) dependencies:
+#     put an empty `.argocd-allow-concurrency` file in the chart directory so
+#     the repo-server renders apps from the same repo in parallel, not one by one.

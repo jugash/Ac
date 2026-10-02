@@ -1,0 +1,354 @@
+# ArgoCD CR for the *application* Argo CD running on a hosted cluster (HCP)
+#
+# Assumptions (from the Q&A):
+#   - OpenShift GitOps 1.15+ (Argo CD 2.13+ / 3.x), argoproj.io/v1beta1
+#   - <200 apps, <20k resources, destination = in-cluster only
+#   - Helm (charts from Git monorepos + Helm/OCI registries)
+#   - Auto-sync + selfHeal + prune on most apps
+#   - Cluster-scoped instance, apps deploy namespaced workloads only
+#   - Dedicated infra nodes (>=3, needed for redis-ha anti-affinity)
+#   - HCP is HighlyAvailable, no API throttling observed
+#   - Git can send webhooks to the route; HA wanted
+#
+# Why one bad resource slows down every app:
+#   Argo CD shards by *cluster*. With one destination (in-cluster), ONE
+#   controller does all the work, and every app shares its status and
+#   operation work queues. When a resource's status keeps changing (an
+#   operator rewriting status, pods restarting, rollout counters), every
+#   change re-queues a full refresh/diff of the owning app. For big apps
+#   that keeps the status workers busy, so the other apps wait in the
+#   queue. selfHeal makes it worse: every flap can also trigger a sync.
+#   The config below:
+#     1. stops status-only churn from triggering refreshes (ignoreResourceUpdates)
+#     2. stops watching high-churn and irrelevant APIs (resourceExclusions)
+#     3. adds health checks that fail fast with Degraded instead of
+#        staying Progressing forever, so waves and hooks don't hang
+#     4. adds more workers and memory, and batches cluster-cache events
+#     5. backs off selfHeal on flapping resources
+#     6. replaces 3m polling of big repos with webhooks + longer resync
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: openshift-gitops          # adjust if you use a custom instance
+  namespace: openshift-gitops
+spec:
+  # ---------------------------------------------------------------------------
+  # Placement: keep Argo CD off the app worker nodes
+  # ---------------------------------------------------------------------------
+  nodePlacement:
+    nodeSelector:
+      node-role.kubernetes.io/infra: ""
+    tolerations:
+      - key: node-role.kubernetes.io/infra
+        operator: Exists
+        effect: NoSchedule
+
+  # Annotation tracking (the default in 3.x; set here to be explicit).
+  # Avoids clashes with the app.kubernetes.io/instance label that Helm charts set.
+  resourceTrackingMethod: annotation
+
+  monitoring:
+    enabled: true                 # ServiceMonitors + PrometheusRules for Argo CD
+
+  # ---------------------------------------------------------------------------
+  # Application controller: the bottleneck for this setup
+  # ---------------------------------------------------------------------------
+  controller:
+    # Sharding is per *cluster*. With only in-cluster it does nothing useful.
+    sharding:
+      enabled: false
+
+    processors:
+      status: 50                  # default 20: concurrent refresh/compare workers
+      operation: 25               # default 10: concurrent sync workers
+
+    # Concurrent kubectl apply operations (default 10)
+    parallelismLimit: 20
+
+    # Periodic resync of every app. Webhooks handle Git changes, so polling
+    # can be much less frequent. Jitter (below, extraConfig) spreads the load.
+    appSync: 10m
+
+    logLevel: info
+
+    resources:
+      requests:
+        cpu: "2"
+        memory: 6Gi
+      limits:
+        # No CPU limit, so the controller isn't throttled under load.
+        memory: 12Gi
+
+    env:
+      # Let the Go GC work harder before the container hits its limit (~90% of limit)
+      - name: GOMEMLIMIT
+        value: "11GiB"
+
+      # Kube API client rate limits (defaults 50/100). HCP is HA and not
+      # throttling, so a moderate increase is enough. Watch apiserver latency
+      # on the management cluster after changing this.
+      - name: ARGOCD_K8S_CLIENT_QPS
+        value: "100"
+      - name: ARGOCD_K8S_CLIENT_BURST
+        value: "200"
+
+      # Batch watch events into the cluster cache instead of taking the cache
+      # lock per event. This matters most when resources churn a lot.
+      # (2.14+, default on in 3.x.)
+      - name: ARGOCD_CLUSTER_CACHE_BATCH_EVENTS_PROCESSING
+        value: "true"
+      - name: ARGOCD_CLUSTER_CACHE_EVENTS_PROCESSING_INTERVAL
+        value: "100ms"
+
+      # Back off selfHeal when an app keeps drifting (e.g. an operator mutates
+      # spec), instead of re-syncing every few seconds.
+      # 2s, 6s, 18s, ... capped at 5m.
+      - name: ARGOCD_APPLICATION_CONTROLLER_SELF_HEAL_BACKOFF_TIMEOUT_SECONDS
+        value: "2"
+      - name: ARGOCD_APPLICATION_CONTROLLER_SELF_HEAL_BACKOFF_FACTOR
+        value: "3"
+      - name: ARGOCD_APPLICATION_CONTROLLER_SELF_HEAL_BACKOFF_CAP_SECONDS
+        value: "300"
+
+      # Big Helm charts can take longer than the default 60s to render.
+      # Must be >= repo execTimeout.
+      - name: ARGOCD_APPLICATION_CONTROLLER_REPO_SERVER_TIMEOUT_SECONDS
+        value: "240"
+
+  # ---------------------------------------------------------------------------
+  # Repo server: Helm rendering for big monorepos + registries
+  # ---------------------------------------------------------------------------
+  repo:
+    replicas: 3
+    execTimeout: 180              # seconds for helm/git commands (default 90)
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        memory: 4Gi
+    env:
+      - name: GOMEMLIMIT
+        value: "3600MiB"
+      # Caps concurrent manifest generations per replica so big monorepo
+      # renders don't OOM the pod (3 replicas x 10 = 30 total).
+      - name: ARGOCD_REPO_SERVER_PARALLELISM_LIMIT
+        value: "10"
+      # Retry transient Git and registry failures instead of reporting ComparisonError
+      - name: ARGOCD_GIT_ATTEMPTS_COUNT
+        value: "3"
+
+  # ---------------------------------------------------------------------------
+  # API server / UI
+  # ---------------------------------------------------------------------------
+  server:
+    autoscale:
+      enabled: true
+      hpa:
+        minReplicas: 2
+        maxReplicas: 4
+        targetCPUUtilizationPercentage: 70
+        scaleTargetRef:
+          apiVersion: apps/v1
+          kind: Deployment
+          name: openshift-gitops-server   # <instance-name>-server
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+    route:
+      enabled: true
+      tls:
+        termination: reencrypt
+        insecureEdgeTerminationPolicy: Redirect
+
+  # ---------------------------------------------------------------------------
+  # Redis HA (needs 3 schedulable infra nodes; the operator uses hard anti-affinity)
+  # ---------------------------------------------------------------------------
+  ha:
+    enabled: true
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+
+  applicationSet:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+
+  # ---------------------------------------------------------------------------
+  # Watch less: high-churn or irrelevant APIs
+  #
+  # NOTE: setting this REPLACES Argo CD's default exclusion list, so the
+  # upstream defaults are repeated here, followed by OpenShift-specific
+  # additions. Only exclude what your apps never deploy.
+  # ---------------------------------------------------------------------------
+  resourceExclusions: |
+    # --- upstream Argo CD defaults ---
+    - apiGroups: ["", "discovery.k8s.io"]
+      kinds: ["Endpoints", "EndpointSlice"]
+    - apiGroups: ["coordination.k8s.io"]
+      kinds: ["Lease"]
+    - apiGroups: ["authentication.k8s.io", "authorization.k8s.io"]
+      kinds: ["SelfSubjectReview", "TokenReview", "LocalSubjectAccessReview",
+              "SelfSubjectAccessReview", "SelfSubjectRulesReview", "SubjectAccessReview"]
+    - apiGroups: ["certificates.k8s.io"]
+      kinds: ["CertificateSigningRequest"]
+    - apiGroups: ["cert-manager.io"]
+      kinds: ["CertificateRequest"]
+    - apiGroups: ["cilium.io"]
+      kinds: ["CiliumIdentity", "CiliumEndpoint", "CiliumEndpointSlice"]
+    - apiGroups: ["kyverno.io", "reports.kyverno.io", "wgpolicyk8s.io"]
+      kinds: ["PolicyReport", "ClusterPolicyReport", "EphemeralReport", "ClusterEphemeralReport",
+              "AdmissionReport", "ClusterAdmissionReport", "BackgroundScanReport",
+              "ClusterBackgroundScanReport", "UpdateRequest"]
+    # --- events / metrics ---
+    - apiGroups: ["", "events.k8s.io"]
+      kinds: ["Event"]
+    - apiGroups: ["metrics.k8s.io"]
+      kinds: ["*"]
+    # --- OpenShift additions ---
+    # OLM copies every all-namespace operator's CSV into EVERY namespace.
+    # These copies are usually the biggest memory cost in the cache on OpenShift.
+    # Safe here because this Argo deploys workloads, not operators.
+    # Remove this entry if apps start managing operators.
+    - apiGroups: ["operators.coreos.com"]
+      kinds: ["ClusterServiceVersion", "InstallPlan"]
+    - apiGroups: ["packages.operators.coreos.com"]
+      kinds: ["*"]
+    # Network diagnostics: high churn
+    - apiGroups: ["controlplane.operator.openshift.io"]
+      kinds: ["PodNetworkConnectivityCheck"]
+    # OAuth tokens: high churn, never GitOps-managed
+    - apiGroups: ["oauth.openshift.io"]
+      kinds: ["OAuthAccessToken", "OAuthAuthorizeToken", "UserOAuthAccessToken"]
+    # Per-namespace virtual copies of cluster quotas
+    - apiGroups: ["quota.openshift.io"]
+      kinds: ["AppliedClusterResourceQuota"]
+    # Virtual image kinds
+    - apiGroups: ["image.openshift.io"]
+      kinds: ["ImageStreamTag", "ImageTag", "ImageStreamImage", "ImageStreamMapping"]
+    # Builds churn a lot; drop this if apps manage Builds directly (BuildConfigs stay)
+    - apiGroups: ["build.openshift.io"]
+      kinds: ["Build"]
+    # Add your own noisy CRDs from the controller debug logs (see notes)
+
+  # ---------------------------------------------------------------------------
+  # Health checks: fail fast instead of Progressing forever
+  #
+  # A sync wave or hook waits until its resources are Healthy. A resource
+  # that stays Progressing blocks that app's sync indefinitely and keeps it
+  # re-queued. Degraded ends the sync attempt, and the app retry/backoff
+  # policy takes over.
+  # ---------------------------------------------------------------------------
+  resourceHealthChecks:
+    # PVCs with WaitForFirstConsumer storage stay Pending until a pod uses
+    # them. The built-in check reports Progressing, which deadlocks a wave
+    # where the PVC comes before its Deployment.
+    - group: ""
+      kind: PersistentVolumeClaim
+      check: |
+        hs = {}
+        if obj.status ~= nil and obj.status.phase ~= nil then
+          if obj.status.phase == "Bound" then
+            hs.status = "Healthy"; hs.message = "Bound"; return hs
+          end
+          if obj.status.phase == "Lost" then
+            hs.status = "Degraded"; hs.message = "Claim lost its volume"; return hs
+          end
+          if obj.status.phase == "Pending" then
+            hs.status = "Healthy"; hs.message = "Pending (WaitForFirstConsumer)"; return hs
+          end
+        end
+        hs.status = "Progressing"; hs.message = "Waiting for PVC status"
+        return hs
+
+    # Template for operator CRs that have no built-in health check.
+    # Repeat per API group (wildcards are allowed in group and kind).
+    # Logic:
+    #   - Progressing until the operator has seen the latest spec (observedGeneration)
+    #   - Degraded on Degraded/Failed/Error=True, or Ready/Available=False with a failure reason
+    #   - Healthy on Ready/Available=True, or when the CR reports status but no conditions
+    - group: "example.com"            # e.g. "postgres-operator.crunchydata.com"
+      kind: "*"
+      check: |
+        hs = {}
+        local function failing(reason)
+          if reason == nil then return false end
+          local r = string.lower(reason)
+          return string.find(r, "fail") ~= nil or string.find(r, "error") ~= nil
+              or string.find(r, "invalid") ~= nil or string.find(r, "backoff") ~= nil
+        end
+        if obj.status == nil then
+          hs.status = "Progressing"; hs.message = "Waiting for operator to report status"; return hs
+        end
+        if obj.metadata.generation ~= nil and obj.status.observedGeneration ~= nil
+           and obj.status.observedGeneration < obj.metadata.generation then
+          hs.status = "Progressing"; hs.message = "Operator has not observed latest generation"; return hs
+        end
+        if obj.status.conditions ~= nil then
+          local ready = nil
+          for _, c in ipairs(obj.status.conditions) do
+            if (c.type == "Degraded" or c.type == "Failed" or c.type == "Error") and c.status == "True" then
+              hs.status = "Degraded"; hs.message = c.message or c.reason or c.type; return hs
+            end
+            if c.type == "Ready" or c.type == "Available" then ready = c end
+          end
+          if ready ~= nil then
+            if ready.status == "True" then
+              hs.status = "Healthy"; hs.message = ready.message or ""; return hs
+            end
+            if failing(ready.reason) then
+              hs.status = "Degraded"; hs.message = ready.message or ready.reason; return hs
+            end
+            hs.status = "Progressing"; hs.message = ready.message or ready.reason or "Not ready"; return hs
+          end
+        end
+        hs.status = "Healthy"; hs.message = "No readiness conditions reported"
+        return hs
+
+  # ---------------------------------------------------------------------------
+  # Diffing: stop selfHeal fighting operators and mutating webhooks
+  # ---------------------------------------------------------------------------
+  resourceIgnoreDifferences:
+    all:
+      # Fields written by these managers are never diffed (and so never
+      # "healed"). Add the field managers of operators and webhooks that
+      # mutate your apps' objects.
+      managedFieldsManagers:
+        - kube-controller-manager
+      #   - my-operator-manager
+    resourceIdentifiers:
+      - group: apps
+        kind: Deployment
+        customization:
+          jsonPointers:
+            - /spec/replicas          # HPA-managed replicas; remove if you don't use HPAs
+
+  # ---------------------------------------------------------------------------
+  # argocd-cm settings without a first-class CR field
+  # ---------------------------------------------------------------------------
+  extraConfig:
+    # Key setting for "one resource slows everyone": changes to these paths
+    # do NOT trigger an app refresh. Health is still recomputed on every
+    # event, so a real Healthy -> Degraded transition still refreshes the app.
+    resource.ignoreResourceUpdatesEnabled: "true"
+    resource.customizations.ignoreResourceUpdates.all: |
+      jsonPointers:
+        - /status
+    # Operators that bump bookkeeping annotations on every reconcile.
+    # Add per kind when the debug logs show them (see notes):
+    # resource.customizations.ignoreResourceUpdates.example.com_MyKind: |
+    #   jqPathExpressions:
+    #     - .metadata.annotations."example.com/last-reconcile"
+
+    # Spread periodic resyncs so 200 apps don't all refresh at once
+    timeout.reconciliation.jitter: 60s
